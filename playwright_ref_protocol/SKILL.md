@@ -22,102 +22,29 @@ description: A protocol to reduce AI token consumption by 90% during Playwright 
 
 ---
 
-## 🏗️ 2. 아키텍처: The "Shadow-Piercing Ref Injector" Pattern
+## 🕵️ 2. 정찰 후 타격 패턴 (Reconnaissance-then-action)
+동적 웹앱(Dynamic Webapp)을 다룰 때 AI 에이전트는 절대 눈먼 상태에서 예측만으로 클릭을 남발해서는 안 됩니다.
+
+1. **Reconnaissance (정찰)**: 페이지 이동(`page.goto`) 또는 조작 후, **반드시 `page.wait_for_load_state('networkidle')`** 을 대기하여 모든 자바스크립트 렌더링이 끝날 때까지 숨을 죽이십시오.
+2. **Scan**: 유휴 상태가 되면 그제서야 DOM 추출 맵(`generateRefMap`)을 실행하거나 스크린샷을 찍어 화면의 렌더링된 최종 상태를 읽어들이십시오.
+3. **Action (타격)**: 확인된 `[data-agent-ref]` ID를 사용하여 정확하게 타격(클릭/타이핑)하십시오.
+
+❌ **금지**: `networkidle` 대기 없이 즉시 DOM을 파싱하려 들거나 화면에 렌더링되지도 않은 요소를 예측만으로 클릭하려는 행위.
+
+---
+
+## 🏗️ 3. 아키텍처: The "Shadow-Piercing Ref Injector" Pattern
 
 대형 상용 웹사이트(쿠팡, 아마존 등)에서 수천 개의 링크가 수집되어 **토큰 절감 목표가 박살 나는 현상(Noise Explosion)**을 방지하기 위해, 요소 수집 상한선(Max Limit)이 적용된 최적화 스크립트를 주입합니다.
 
 ### 단계 1: DOM 추출 및 Ref 주입 스크립트 실행
-에이전트는 브라우저 렌더링 유휴 상태(`networkidle`)에서, 정밀 힌트(Hints)와 수집 허들(Limit 150)이 결합된 스크립트를 실행합니다.
+에이전트는 브라우저 렌더링 유휴 상태(`networkidle`)에서, 정밀 힌트(Hints)와 수집 허들(Limit 150)이 결합된 스크립트를 실행해야 합니다.
 
-```javascript
-// [💡 Core Ref Injector (Playwright Context - Ultimate ROI & Performance)]
-const generateRefMap = () => {
-  const interactableSelectors = 'a[href], button, input, textarea, select, iframe, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])';
-  const elements = new Set();
-
-  // 1. 재귀적 DOM 순회 함수 (Shadow DOM 투과)
-  const traverse = (node) => {
-    if (!node) return;
-    if (node.nodeType === 1 && node.matches && node.matches(interactableSelectors)) elements.add(node);
-    if (node.shadowRoot) traverse(node.shadowRoot);
-    for (const child of node.childNodes) traverse(child);
-  };
-
-  traverse(document);
-
-  let refCounter = 0;
-  const refMap = [];
-  const viewportHeight = window.innerHeight;
-  const viewportWidth = window.innerWidth;
-  
-  // 🚨 토큰 다이어트 한계: 무의미한 수백개 요소 수집 차단
-  const MAX_ELEMENTS = 150; 
-
-  // 배열로 변환하여 화면(가시성) 우선순위로 약간의 랭킹 부여 가능 (여기는 기본 순회)
-  const elArray = Array.from(elements);
-
-  for (let i = 0; i < elArray.length; i++) {
-    if (refCounter >= MAX_ELEMENTS) {
-       refMap.push(`\n... [Warning: Max Limits Hit (${MAX_ELEMENTS}). Omitted trailing nodes. Please Scope Down your search.]`);
-       break;
-    }
-    const el = elArray[i];
-
-    // 2. 가시성 1차 초고속 필터링 (Layout Thrashing 방지)
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-
-    // 3. 2차 정밀 스크린 판별
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0 || rect.x < -9999) continue;
-    
-    // [힌트 1] 스크롤 밖 (Off-Screen) 판단
-    const isOffScreen = (rect.y > viewportHeight || rect.x > viewportWidth) ? '[OffScreen] ' : '';
-
-    // [힌트 2] 요소가 다른 모달/오버레이에 가려져 있는지 (Obscured) Z-Index 장애물 판별
-    let isObscured = '';
-    if (!isOffScreen) {
-      const centerX = rect.x + rect.width / 2;
-      const centerY = rect.y + rect.height / 2;
-      const topEl = document.elementFromPoint(centerX, centerY);
-      if (topEl && topEl !== el && !el.contains(topEl)) {
-         isObscured = '[Obscured] ';
-      }
-    }
-
-    // 4. 고유 Ref ID 부여
-    const refId = `@e${refCounter++}`;
-    el.setAttribute('data-agent-ref', refId);
-
-    const tagName = el.tagName.toLowerCase();
-
-    // 5. iFrame(Cross-Origin) 인지 힌트
-    if (tagName === 'iframe') {
-      const src = el.getAttribute('src') || 'unknown';
-      refMap.push(`[${refId}] ${isOffScreen}${isObscured}iframe[src="${src}"] "External Frame (Requires Context Switch)"`);
-      continue;
-    }
-
-    // 6. 노이즈 없는 라벨(Label) 및 [힌트 3] 아이콘 버튼 텍스트 추론
-    let rawLabel = el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || '';
-    let label = rawLabel.replace(/\s+/g, ' ').trim();
-    
-    if (!label) {
-       const clue = el.id || el.className || 'IconOnly';
-       label = `[NoText: ${clue.substring(0, 15)}]`;
-    } else if (label.length > 50) {
-       label = label.substring(0, 47) + '...';
-    }
-
-    // 7. 타입 속성 부착 시그니처 조립
-    const typeAttr = el.hasAttribute('type') ? `[type="${el.getAttribute('type')}"]` : '';
-    
-    refMap.push(`[${refId}] ${tagName}${typeAttr} ${isOffScreen}${isObscured}"${label}"`);
-  }
-
-  return refMap.join('\n');
-};
-```
+**[⚠️ 컨텍스트 윈도우 보호 (Token Saving Lazy Loading)]**
+이 스크립트 소스는 토큰 절약을 위해 이 문서에 포함되어 있지 않습니다.
+실제 브라우저 테스트 코드 작성이 필요할 때만 `view_file` 도구를 사용하여 아래 경로의 핵심 파서를 런타임에 읽어와서 파악하십시오:
+👉 **가져올 파일 절대 경로**: `/Users/jay/.gemini/antigravity/skills/playwright_ref_protocol/references/ref_injector.js`
+(에이전트는 필요할 때 이 파일을 단 한 번 읽은 후 해당 로직을 `page.evaluate`에 주입하여 사용합니다.)
 
 ---
 
